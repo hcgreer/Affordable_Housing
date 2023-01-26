@@ -1,0 +1,243 @@
+---
+title: "hg_affordable_housing"
+output: html_notebook
+---
+```{r}
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(htmltools)
+library(scales)
+library(units)
+```
+
+Reading in the data.
+```{r}
+#property details about each single family home sold since 1995.
+property_details <- read.csv(file = "../data/property_details.csv")
+#Data of all the Low Income Housing Tax Credit units 
+LIHTC <- read.csv(file = "../data/LIHTC_updated.csv")
+#Data of the sale price if single family homes since 1995
+filtered_sales <- read.csv(file = "../data/filtered_sales.csv")
+#Data about completed rental property funded by Barnes housing trust fund
+barnes <- read.csv(file = "../data/barnes.csv")
+```
+
+Step 1 of the data cleaning process was to clean and combine the two low income housing data sets together.
+```{r}
+#Filtering down LIHTC data to useful columns and apply conventional column names so they can be stacked.
+LIHTC <- LIHTC %>% 
+  select(YR_PIS, LATITUDE, LONGITUDE, HUD_ID) %>% 
+  rename(id = HUD_ID, year = YR_PIS, lat = LATITUDE, lng = LONGITUDE) %>%
+  mutate(type = 'LIHTC') #adding a type column
+
+#Filtering down Barnes data to useful columns and apply conventional column names so they can be stacked.
+barnes <- barnes %>% 
+  select(Barnes.Year, lat, lng) %>% 
+  mutate(bid = paste0('B', row_number())) %>% #Creating unique id's per unit
+  rename(id = bid, year = Barnes.Year) %>% 
+  mutate(type = 'barnes') #adding a type column
+
+#Creating one tibble containing both LIHTC and Barnes data
+all_ah_info <- LIHTC %>% 
+  bind_rows(barnes) %>%
+  filter(year >= 2000 & year < 5000) #Filtering out unusable years. 
+```
+
+Step 2 of the data cleaning process is to extract a usable date for the filtered sales data.
+```{r}
+#Extracting the year from a string of the date of sale.
+filtered_sales$year_of_sale <- str_sub(filtered_sales$ownerdate, 1, 4)
+
+#Turning the newly extracted year into a number.
+filtered_sales <- transform(filtered_sales, year_of_sale = as.numeric(year_of_sale))
+
+#Turned the remain string of the date into an actually date.
+filtered_sales$ownerdate <- lubridate::as_date(filtered_sales$ownerdate)
+
+#Renaming the column with the newly formed date to date.
+filtered_sales <- filtered_sales %>% 
+  rename(date = ownerdate)
+```
+
+Step 3 of the data cleaning process is splitting apart the centroid for the property details data into a usable latitude and longitude.
+```{r}
+#Separating the centroid column into lat and lng columns.
+property_details <- property_details %>% 
+  separate(centroid, c('lng', 'lat'), ',')
+
+#Removing the unwanted parenthesis ate the start and end of lat and lng.
+property_details$lng <- str_remove(property_details$lng, '[(]')
+property_details$lat <- str_remove(property_details$lat, '[)]')
+```
+
+Merging the filtered sales data to the property details so we have one tibble containing all the information about the house sales.
+```{r}
+property_details <- inner_join(filtered_sales, property_details, by = 'apn')
+```
+
+Converting the lat and lng columns to a geometry.
+```{r}
+property_details <- property_details %>% 
+  st_as_sf(coords = c("lat", "lng"), crs = 4326, agr = "identity") %>% 
+  rename(home_loc = geometry)
+
+all_ah_info <- all_ah_info %>% 
+  st_as_sf(coords = c("lat", "lng"), crs = 4326, agr = "identity")
+```
+
+Now using the newly formed geometry columns we can find the nearest affordable housing to each home sold since 1995 and combine them together to have all the information in one tibble.
+```{r}
+nearest_ah <- bind_cols(property_details, 
+          all_ah_info[st_nearest_feature(property_details, all_ah_info), ])
+```
+
+Using the nearest affordable housing found a distance can be calculated.
+```{r}
+nearest_ah <- nearest_ah %>% 
+  mutate(dist = st_distance(nearest_ah$home_loc, nearest_ah$geometry, by_element = T))
+
+nearest_ah$dist <- drop_units(nearest_ah$dist/1609.34) #Converting meters to miles
+```
+
+Now that there is data about distance, groups can be made to clump the houses sold together. 
+  "pre" - for homes where the distance is less than half a mile and whose sale date was 2-5 years prior to the input year of the affordable housing
+  
+  "mid" - for homes where the distance is less than half a mile and whose sale date was 0-2 years prior to the input year of the affordable housing
+  
+  "post" - for homes where the distance is less than half a mile and whose sale date was after the input year of the affordable housing
+  
+  "outside" - for homes where the distance is more than half a mile
+  
+  "other" - All other rows
+```{r}
+#Only interested in house within 1 mile of the affordable housing.
+nearest_ah <- nearest_ah %>% 
+  filter(dist <= 1)
+
+#Using case_when to apply the desired groups.
+nearest_ah <- nearest_ah %>% 
+  mutate(
+    group = case_when(
+    dist <= .5 & year - year_of_sale >= 2 & year - year_of_sale <= 5 ~ 'pre',
+    dist <= .5 & year - year_of_sale < 2 & year - year_of_sale >= 0 ~ 'mid',
+    dist <= .5 & year_of_sale - year > 0 ~ 'post',
+    dist > .5 ~ 'outside',
+    T ~ 'other'
+    )
+  ) %>% 
+  filter(group != 'other') #Filtering out the other group.
+```
+
+Finishing the last steps of data cleaning by creating an age of home column and filtering the data down to sales that occurred 5 years before or after an affordable housing was established.
+```{r}
+nearest_ah <- nearest_ah %>% 
+  mutate(age = year_of_sale - year_built) %>% 
+  filter(age >= 0, square_footage > 0, amount > 0) %>% #Some ages, square footage, and amounts were less than 0
+  drop_na(age)
+
+nearest_ah <- nearest_ah %>% 
+  filter(year - year_of_sale <= 5 & year_of_sale - year <= 5) %>% 
+  distinct() %>% 
+  filter(amount <= 10000000) #There were several instances where multiple homes were purchased for large amounts of money so this cuts out those outliers. 
+```
+
+First attempt at building a model to see if there is an effect of affordable housing on home prices.
+```{r}
+lm_log <- lm(data = nearest_ah, formula = 'log(amount) ~ log(square_footage) + age + relevel(factor(group), ref = "outside") + factor(year_of_sale) + factor(tract)')
+```
+
+Taking those coefficients and comparing the pre affordable housing to the outside group.
+```{r}
+#pulling pre coefficient from model
+pre_coeff <- lm_log$coefficients[paste0('relevel(factor(group), ref = "outside")pre')] 
+
+#pulling the standard error for pre from model
+std_err <- sqrt(vcov(lm_log)[paste0('relevel(factor(group), ref = "outside")pre'), paste0('relevel(factor(group), ref = "outside")pre')])
+
+#returns the percent of the amount of a house sold pre verses outside with a confidence interval of 95%
+exp(pre_coeff) 
+exp(pre_coeff - 1.96 * std_err)
+exp(pre_coeff + 1.96 * std_err)
+```
+We see that with 95% confidence that pre affordable housing homes are sold for 101.8% to 100.2% of the amount that outside homes are sold for. So they are essentially the same.
+
+Now comparing the post affordable housing homes to the outside homes.
+```{r}
+#pulling post coefficient from model
+post_coeff <- lm_log$coefficients[paste0('relevel(factor(group), ref = "outside")post')] 
+
+#pulling the standard error for post from model
+std_err <- sqrt(vcov(lm_log)[paste0('relevel(factor(group), ref = "outside")post'), paste0('relevel(factor(group), ref = "outside")post')])
+
+#returns the percent of the amount of a house sold post verses outside with a confidence interval of 95%
+exp(post_coeff) 
+exp(post_coeff - 1.96 * std_err)
+exp(post_coeff + 1.96 * std_err)
+```
+We are returned with 95% confidence that post affordable housing homes are sold for 99.02% to 97.53% of the amount that outside homes are sold for. From this we can see that there has been a slight, but statistical significant, decrease in the amount a house was sold for post affordable housing. 
+
+Now comparing the counterfactual to actual to see if there is a possibility for there to be a heavy skewness one way.
+```{r}
+post_pre_coeff <- lm_log$coefficients[paste0('relevel(factor(group), ref = "outside")post')] - lm_log$coefficients[paste0('relevel(factor(group), ref = "outside")pre')]
+
+std_error <- sqrt(
+  vcov(lm_log)[paste0('relevel(factor(group), ref = "outside")post'), paste0('relevel(factor(group), ref = "outside")post')] + vcov(lm_log)[paste0('relevel(factor(group), ref = "outside")pre'), paste0('relevel(factor(group), ref = "outside")pre')] + 2 * vcov(lm_log)[paste0('relevel(factor(group), ref = "outside")post'), paste0('relevel(factor(group), ref = "outside")pre')]
+)
+
+lower_bound <- post_pre_coeff - 1.96*std_error
+upper_bound <- post_pre_coeff + 1.96*std_error
+
+exp(post_pre_coeff) - 1
+exp(lower_bound) - 1
+exp(upper_bound) - 1 
+```
+Something here about what this tells us.
+
+Those previous percentages are on the assumption that the outside group is unaffected post affordable housing. To correct for this the outside group will be split into pre, mid and post using the same criterion that was used for the inside group.
+```{r}
+nearest_ah_new <- nearest_ah %>% 
+  mutate(
+    new_group = case_when(
+    dist <= .5 & year - year_of_sale >= 2 & year - year_of_sale <= 5 ~ 'pre',
+    dist <= .5 & year - year_of_sale < 2 & year - year_of_sale >= 0 ~ 'mid',
+    dist <= .5 & year_of_sale - year > 0 ~ 'post',
+    dist > .5 & year - year_of_sale >= 2 & year - year_of_sale <= 5 ~ 'outside_pre',
+    dist > .5 & year - year_of_sale < 2 & year - year_of_sale >= 0 ~ 'outside_mid',
+    dist > .5 & year_of_sale - year > 0 ~ 'outside_post',
+    T ~ 'other'
+    )
+  ) %>% 
+  filter(new_group != 'other')
+```
+
+Running the second model with the upgraded groups.
+```{r}
+lm_log <- lm(data = nearest_ah_new, formula = 'log(amount) ~ log(square_footage) + age + relevel(factor(new_group), ref = "outside_pre") + year_of_sale + factor(tract)')
+```
+
+Now we are comparing pre affordable housing home to the pre affordable housing homes outside group.
+```{r}
+pre_coeff <- lm_log$coefficients[paste0('relevel(factor(new_group), ref = "outside_pre")pre')]
+
+std_err <- sqrt(vcov(lm_log)[paste0('relevel(factor(new_group), ref = "outside_pre")pre'), paste0('relevel(factor(new_group), ref = "outside_pre")pre')])
+
+exp(pre_coeff)
+exp(pre_coeff - 1.96 * std_err)
+exp(pre_coeff + 1.96 * std_err)
+```
+Now we can say with 95% confidence that pre affordable housing homes were bring sold for 94.33% to 92.36% of the amount that pre affordable housing, outside homes were being sold for. There is an interesting decrease, but we are mostly focused on the pre against the post over the outside against inside. 
+
+Now we are going to compare the post affordable housing homes to the post affordable housing, outside homes.To do this we will subtract both post coefficients and calculate the new standard error so we can view if there is a drop when we compare post affordable housing back to pre affordable housing, outside group.
+```{r}
+post_coeff <- lm_log$coefficients[paste0('relevel(factor(new_group), ref = "outside_pre")post')] - lm_log$coefficients[paste0('relevel(factor(new_group), ref = "outside_pre")outside_post')]
+
+std_err <- sqrt(
+  vcov(lm_log)[paste0('relevel(factor(new_group), ref = "outside_pre")post'), paste0('relevel(factor(new_group), ref = "outside_pre")post')] + vcov(lm_log)[paste0('relevel(factor(new_group), ref = "outside_pre")outside_post'), paste0('relevel(factor(new_group), ref = "outside_pre")outside_post')] + 2 * vcov(lm_log)[paste0('relevel(factor(new_group), ref = "outside_pre")post'), paste0('relevel(factor(new_group), ref = "outside_pre")outside_post')]
+)
+
+exp(post_coeff)
+exp(post_coeff - 1.96 * std_err)
+exp(post_coeff + 1.96 * std_err)
+```
+It seems there is an ever so slight but statically significant increase in the values of the homes post affordable housing compared to those further away.
